@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 *.egg-info/
 .run/
+.env
+.env.local
+.env.*.local
+.claude/
+dev.db
+dev.db-journal
+logs/
