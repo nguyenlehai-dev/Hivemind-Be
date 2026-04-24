@@ -10,15 +10,30 @@ Runway login page — inspect the DOM, prefer ``data-testid`` / ``role`` / label
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 from dataclasses import dataclass
 
 from playwright.async_api import (
+    BrowserContext,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+_AUTH_COOKIE_NAMES = {
+    "__session",
+    "__clerk_db_jwt",
+    "__client",
+    "runway_session",
+    "auth_token",
+    "session",
+}
 
 
 class PlaywrightLoginError(Exception):
@@ -57,58 +72,149 @@ class PlaywrightLoginService:
 
             try:
                 await page.goto(settings.runway_login_url, wait_until="domcontentloaded")
-                await self._fill_credentials(page, email, password)
-                await self._submit(page)
-                landed = await self._await_success(page)
+                logger.info("runway login page loaded url=%s", page.url)
+                try:
+                    await self._fill_credentials(page, email, password)
+                    await self._submit(page)
+                    logger.info("runway login form submitted")
+                except PlaywrightTimeoutError as exc:
+                    logger.warning(
+                        "auto-fill failed (%s); relying on manual completion in the open window",
+                        exc,
+                    )
+                landed = await self._await_success(context, page)
                 storage_state = await context.storage_state()
                 return PlaywrightLoginResult(
                     storage_state=storage_state,
                     landed_url=landed,
                 )
             except PlaywrightTimeoutError as exc:
+                urls = [p.url for p in context.pages]
                 raise PlaywrightLoginError(
-                    "Timed out waiting for Runway login. The page layout may "
-                    "have changed — update selectors in playwright_login.py "
-                    "or retry with headless=False to inspect.",
+                    "Timed out waiting for Runway login. Pages currently open: "
+                    f"{urls}. If a Cloudflare/OAuth popup appeared, complete it "
+                    "in the open window. Increase HIVEMIND_RUNWAY_PLAYWRIGHT_TIMEOUT_MS.",
                 ) from exc
             finally:
                 await context.close()
                 await browser.close()
 
     async def _fill_credentials(self, page: Page, email: str, password: str) -> None:
-        # Try role-based selectors first (stable across style changes), then
-        # fall back to common input attributes.
-        email_input = page.get_by_label("Email", exact=False).first
-        password_input = page.get_by_label("Password", exact=False).first
+        email_selectors = (
+            'input[type="email"], input[name="email"], '
+            'input[name="identifier"], input[autocomplete="username"]'
+        )
+        password_selectors = (
+            'input[type="password"], input[name="password"]'
+        )
 
+        await page.locator(email_selectors).first.fill(email, timeout=20_000)
+
+        # Runway uses a two-step flow (Clerk-style): email → Continue → password.
+        # If password is already visible, fill both. Otherwise click Continue
+        # then wait for password field.
+        password_locator = page.locator(password_selectors).first
         try:
-            await email_input.fill(email, timeout=5_000)
-            await password_input.fill(password, timeout=5_000)
+            await password_locator.wait_for(state="visible", timeout=2_000)
         except PlaywrightTimeoutError:
-            # Fallback selectors
-            await page.locator(
-                'input[type="email"], input[name="email"], input[autocomplete="username"]'
-            ).first.fill(email)
-            await page.locator(
-                'input[type="password"], input[name="password"]'
-            ).first.fill(password)
+            await self._click_continue(page)
+            await password_locator.wait_for(state="visible", timeout=30_000)
 
-    async def _submit(self, page: Page) -> None:
-        submit = page.get_by_role("button", name="Log in", exact=False).first
-        try:
-            await submit.click(timeout=5_000)
-            return
-        except PlaywrightTimeoutError:
-            pass
+        await password_locator.fill(password, timeout=10_000)
 
-        # Fallback: a form submit on enter.
+    async def _click_continue(self, page: Page) -> None:
+        for name in ("Continue", "Next", "Log in", "Sign in"):
+            btn = page.get_by_role("button", name=name, exact=False).first
+            try:
+                await btn.click(timeout=2_000)
+                return
+            except PlaywrightTimeoutError:
+                continue
         await page.keyboard.press("Enter")
 
-    async def _await_success(self, page: Page) -> str:
-        """Wait for dashboard navigation away from the login page."""
-        prefix = settings.runway_dashboard_url_prefix.rstrip("/")
-        await page.wait_for_url(
-            lambda url: url.startswith(prefix) and "/login" not in url,
-            timeout=settings.runway_playwright_timeout_ms,
+    async def _submit(self, page: Page) -> None:
+        for name in ("Log in", "Sign in", "Continue"):
+            btn = page.get_by_role("button", name=name, exact=False).first
+            try:
+                await btn.click(timeout=5_000)
+                return
+            except PlaywrightTimeoutError:
+                continue
+        await page.keyboard.press("Enter")
+
+    async def _await_success(self, context: BrowserContext, page: Page) -> str:
+        """Poll every open page and the cookie jar until we look logged in.
+
+        Runway may open Cloudflare/OAuth popups during login. We watch all
+        pages in the context and also inspect cookies, so we detect success
+        regardless of which window lands on the dashboard.
+        """
+
+        def is_logged_in_url(url: str) -> bool:
+            if not url or "runwayml.com" not in url:
+                return False
+            lowered = url.lower()
+            if any(
+                seg in lowered
+                for seg in (
+                    "/login",
+                    "/sign-in",
+                    "/signin",
+                    "/sign-up",
+                    "/signup",
+                    "/verify",
+                    "/challenge",
+                )
+            ):
+                return False
+            if lowered.rstrip("/").endswith("runwayml.com"):
+                return False
+            return True
+
+        timeout_s = settings.runway_playwright_timeout_ms / 1000
+        deadline = time.monotonic() + timeout_s
+        last_log = 0.0
+
+        while time.monotonic() < deadline:
+            for p in list(context.pages):
+                if p.is_closed():
+                    continue
+                try:
+                    url = p.url
+                except Exception:
+                    continue
+                if is_logged_in_url(url):
+                    logger.info("runway login success detected url=%s", url)
+                    return url
+
+            cookies = await context.cookies()
+            auth_hits = [
+                c for c in cookies
+                if "runwayml.com" in c.get("domain", "")
+                and c.get("name") in _AUTH_COOKIE_NAMES
+            ]
+            if auth_hits:
+                # Cookies are set — wait briefly for any page to settle on
+                # a dashboard URL, else accept the most recent runway page.
+                await asyncio.sleep(1.5)
+                for p in list(context.pages):
+                    if p.is_closed():
+                        continue
+                    url = p.url
+                    if "runwayml.com" in url and "/login" not in url.lower():
+                        logger.info(
+                            "runway auth cookies present; accepting url=%s", url,
+                        )
+                        return url
+
+            now = time.monotonic()
+            if now - last_log > 10:
+                urls = [p.url for p in context.pages if not p.is_closed()]
+                logger.info("waiting for runway login; open pages=%s", urls)
+                last_log = now
+
+            await asyncio.sleep(1)
+
+        raise PlaywrightTimeoutError(
+            f"runway login did not complete within {timeout_s:.0f}s",
         )
-        return page.url
